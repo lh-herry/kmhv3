@@ -1,0 +1,32 @@
+//commit 4b7f0725128f5adc2be03f4df96f76f8d081c75d
+//Author: zhou tao <mayflyandtree@163.com>
+//Date:   Fri May 22 16:06:08 2026 +0800
+//
+//    fix(ifu): fix instruction concatenation error during cross-channel fetch (#5985)
+//    
+//    This PR needs to wait for PR #5962 and PR #5959 to be merged first.
+//    
+//    Fix description: Route cross-page uncache data to S1 for unified
+//    management. S3 can now directly concatenate uncache instructions using
+//    s3_prevLastIsHalfRvi during fetch. This fixes the edge case where
+//    instructions spanning both cache and uncache channels fell through the
+//    cracks of the existing S1 (cache) and S3 (uncache) cross-page handling
+//    logic.
+//diff --git a/src/main/scala/top/Configs.scala b/src/main/scala/top/Configs.scala
+//index 526dc5793..c6ac4bbce 100644
+//--- a/src/main/scala/top/Configs.scala
+//+++ b/src/main/scala/top/Configs.scala
+//@@ -605,6 +605,13 @@ class TLConfig(n: Int = 1) extends Config(
+// )
+// class DefaultConfig(n: Int = 1) extends TLConfig(n) with DeprecatedConfigWarning
+// 
+//+class Kmhv3Config(n: Int = 1) extends Config(
+//+  L3CacheConfig("16MB", inclusive = false, banks = 4, ways = 16)
+//+    ++ L2CacheConfig("1MB", inclusive = true, banks = 4)
+//+    ++ WithNKBL1D(64, ways = 4)
+//+    ++ new BaseConfig(n)
+//+)
+//+
+// class TLCVMConfig(n: Int = 1) extends Config(
+//   new CVMCompile
+//     ++ new TLConfig(n)
