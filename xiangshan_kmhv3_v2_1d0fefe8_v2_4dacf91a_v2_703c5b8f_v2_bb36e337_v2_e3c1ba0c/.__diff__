@@ -1,0 +1,236 @@
+//commit b30d9d321f06274ff88cf3db27c6b6b9f5eef40a
+//Author: Zhihao Xu <ngc7331@outlook.com>
+//Date:   Thu May 28 10:53:59 2026 +0800
+//
+//    ci(emu): better log archive (#6033)
+//    
+//    - print unsorted stderr.log if failed
+//    - do not run 'Archive log' step if previous steps are already failed
+//    - archive emu-basics stdout regardless of matrix.report
+//    - rename matrix.report to matrix.report-perf to clarify this is to
+//    report performance-related info (IPC and stderr)
+//    
+//    Signed-off-by: ngc7331 <ngc7331@outlook.com>
+//diff --git a/src/main/scala/top/Configs.scala b/src/main/scala/top/Configs.scala
+//index 771119e44..324483e89 100644
+//--- a/src/main/scala/top/Configs.scala
+//+++ b/src/main/scala/top/Configs.scala
+//@@ -537,6 +537,13 @@ class DefaultConfig(n: Int = 1) extends Config(
+//     ++ new BaseConfig(n)
+// )
+// 
+//+class Kmhv3Config(n: Int = 1) extends Config(
+//+  OpenLLCConfig("16MB", ways = 16, banks = 4)
+//+    ++ L2CacheConfig("1MB", inclusive = true, banks = 4, tp = false)
+//+    ++ WithNKBL1D(64, ways = 4)
+//+    ++ new BaseConfig(n)
+//+)
+//+
+// class CVMConfig(n: Int = 1) extends Config(
+//   new CVMCompile
+//     ++ new DefaultConfig(n)
+//diff --git a/src/main/scala/xiangshan/backend/dispatch/Dispatch.scala b/src/main/scala/xiangshan/backend/dispatch/Dispatch.scala
+//index ef8dab8af..0d5ef6882 100644
+//--- a/src/main/scala/xiangshan/backend/dispatch/Dispatch.scala
+//+++ b/src/main/scala/xiangshan/backend/dispatch/Dispatch.scala
+//@@ -477,9 +477,18 @@ class Dispatch(implicit p: Parameters) extends XSModule with HasPerfEvents with
+//       }
+//     }
+// 
+//+    val rrStart = RegInit(0.U(log2Ceil(iqNum).W))
+//+    val rrFire = fromRename.map { uop =>
+//+      uop.fire && fus.map(fu => uop.bits.fuType(fu.fuType.id)).reduce(_ || _)
+//+    }.reduce(_ || _)
+//+    when(rrFire) {
+//+      rrStart := Mux(rrStart === (iqNum - 1).U, 0.U, rrStart + 1.U)
+//+    }
+//+
+//     val minIQSel = Wire(Vec(renameWidth, Vec(issueQueueNum, Bool()))).suggestName(s"minIQSel_$suffix")
+//     for (i <- 0 until renameWidth){
+//-      val minIQSel_ith = (if (enableDispatchIQBalanceOpt) IQSortUpdate(i % iqNum) else IQSort(i % iqNum))
+//+      val rrIdx = (rrStart + i.U) % iqNum.U
+//+      val minIQSel_ith = (if (enableDispatchIQBalanceOpt) IQSortUpdate(rrIdx) else IQSort(rrIdx))
+//       for (j <- 0 until issueQueueNum){
+//         minIQSel(i)(j) := false.B
+//         if (iqidx.contains(j)){
+//diff --git a/src/main/scala/xiangshan/backend/rename/freelist/MEFreeList.scala b/src/main/scala/xiangshan/backend/rename/freelist/MEFreeList.scala
+//index 4394f0404..ba8af6348 100644
+//--- a/src/main/scala/xiangshan/backend/rename/freelist/MEFreeList.scala
+//+++ b/src/main/scala/xiangshan/backend/rename/freelist/MEFreeList.scala
+//@@ -35,6 +35,11 @@ class MEFreeList(size: Int, commitWidth: Int)(implicit p: Parameters) extends Ba
+//   val doNormalRename = io.canAllocate && io.doAllocate && !io.redirect
+//   val doRename = doWalkRename || doNormalRename
+//   val doCommit = io.commit.doCommit
+//+  val normalAllocateCount = PopCount(io.allocateReq)
+//+  val freeReqCount = PopCount(io.freeReq)
+//+  val recentFreeBypassCount = Mux(doNormalRename, freeReqCount min normalAllocateCount, 0.U)
+//+  val remainingAllocateCount = normalAllocateCount - recentFreeBypassCount
+//+  val remainingFreeCount = freeReqCount - recentFreeBypassCount
+// 
+//   val freeListVec = Wire(Vec(size, Vec(RenameWidth, UInt(PhyRegIdxWidth.W))))
+//   for (i <- 0 until size) {
+//@@ -53,7 +58,17 @@ class MEFreeList(size: Int, commitWidth: Int)(implicit p: Parameters) extends Ba
+//   val phyRegCandidates = Mux1H(headPtrOHVec(0), freeListVec)
+//   for (i <- 0 until RenameWidth) {
+//     // enqueue instr, is move elimination
+//-    io.allocatePhyReg(i) := phyRegCandidates(PopCount(io.allocateReq.take(i)))
+//+    val allocIdx = PopCount(io.allocateReq.take(i))
+//+    val recentFreeCandidates = VecInit((0 until commitWidth).map { j =>
+//+      Mux1H(io.freeReq.zip(io.freePhyReg).zipWithIndex.map { case ((req, preg), idx) =>
+//+        (req && PopCount(io.freeReq.take(idx)) === allocIdx) -> preg
+//+      })
+//+    })
+//+    io.allocatePhyReg(i) := Mux(
+//+      allocIdx < recentFreeBypassCount,
+//+      recentFreeCandidates(allocIdx),
+//+      phyRegCandidates(allocIdx - recentFreeBypassCount)
+//+    )
+//   }
+//   // update arch head pointer
+//   val archAlloc = io.commit.archAlloc
+//@@ -64,7 +79,7 @@ class MEFreeList(size: Int, commitWidth: Int)(implicit p: Parameters) extends Ba
+//   archHeadPtr := archHeadPtrNext
+// 
+//   // update head pointer
+//-  val numAllocate = Mux(io.walk, PopCount(io.walkReq), PopCount(io.allocateReq))
+//+  val numAllocate = Mux(io.walk, PopCount(io.walkReq), remainingAllocateCount)
+//   val headPtrNew   = Mux(lastCycleRedirect, redirectedHeadPtr, headPtr + numAllocate)
+//   val headPtrOHNew = Mux(lastCycleRedirect, redirectedHeadPtrOH, headPtrOHVec(numAllocate))
+//   val headPtrNext   = Mux(doRename, headPtrNew, headPtr)
+//@@ -75,10 +90,11 @@ class MEFreeList(size: Int, commitWidth: Int)(implicit p: Parameters) extends Ba
+//   /**
+//     * Deallocation: when refCounter becomes zero, the register can be released to freelist
+//     */
+//-  val freePtr = VecInit(Seq.tabulate(commitWidth)(i => tailPtr + PopCount(io.freeReq.take(i))))
+//+  val freePtr = VecInit(Seq.tabulate(commitWidth)(i => tailPtr + i.U))
+//   for (i <- 0 until size) {
+//     val freeReqOH = VecInit(io.freeReq.zipWithIndex.map { case (w, idx) =>
+//-      w && freePtr(idx).value === i.U
+//+      val freeIdx = PopCount(io.freeReq.take(idx))
+//+      w && freeIdx >= recentFreeBypassCount && freePtr((freeIdx - recentFreeBypassCount).asUInt).value === i.U
+//     })
+//     val freePhyReg = Mux1H(freeReqOH, io.freePhyReg)
+//     when(freeReqOH.asUInt.orR) {
+//@@ -87,14 +103,14 @@ class MEFreeList(size: Int, commitWidth: Int)(implicit p: Parameters) extends Ba
+//   }
+// 
+//   // update tail pointer
+//-  val tailPtrNext = tailPtr + PopCount(io.freeReq)
+//+  val tailPtrNext = tailPtr + remainingFreeCount
+//   tailPtr := tailPtrNext
+// 
+//   val freeRegCnt = Mux(doWalkRename && !lastCycleRedirect, distanceBetween(tailPtrNext, headPtr) - PopCount(io.walkReq),
+//-                   Mux(doNormalRename,                     distanceBetween(tailPtrNext, headPtr) - PopCount(io.allocateReq),
+//+                   Mux(doNormalRename,                     distanceBetween(tailPtrNext, headPtr) - remainingAllocateCount,
+//                                                            distanceBetween(tailPtrNext, headPtr)))
+//   val freeRegCntReg = RegNext(freeRegCnt)
+//-  io.canAllocate := freeRegCntReg >= RenameWidth.U
+//+  io.canAllocate := freeRegCntReg +& freeReqCount >= normalAllocateCount
+// 
+//   if(backendParams.debugEn){
+//     val debugArchHeadPtr = RegNext(RegNext(archHeadPtr, FreeListPtr(false, 0)), FreeListPtr(false, 0)) // two-cycle delay from refCounter
+//diff --git a/src/main/scala/xiangshan/backend/rename/freelist/StdFreeList.scala b/src/main/scala/xiangshan/backend/rename/freelist/StdFreeList.scala
+//index e7686e6a4..e8b14d542 100644
+//--- a/src/main/scala/xiangshan/backend/rename/freelist/StdFreeList.scala
+//+++ b/src/main/scala/xiangshan/backend/rename/freelist/StdFreeList.scala
+//@@ -36,14 +36,20 @@ class StdFreeList(
+//   val freeList = RegInit(VecInit(Seq.tabulate(freeListSize)( i => (i + numLogicRegs).U(PhyRegIdxWidth.W) )))
+//   val tailPtr = RegInit(FreeListPtr(true, 0)) // tailPtr in the last cycle (need to add freeReqReg)
+//   val tailPtrNext = Wire(new FreeListPtr) // this is the real tailPtr
+//+  val normalAllocateCount = PopCount(io.allocateReq)
+//+  val freeReqCount = PopCount(io.freeReq)
+//+  val recentFreeBypassCount = Wire(UInt(log2Ceil(RenameWidth + 1).W))
+//+  val remainingAllocateCount = normalAllocateCount - recentFreeBypassCount
+//+  val remainingFreeCount = freeReqCount - recentFreeBypassCount
+// 
+//   //
+//   // free committed instructions' `old_pdest` reg
+//   //
+//-  val freePtr = VecInit(Seq.tabulate(commitWidth)(i => tailPtr + PopCount(io.freeReq.take(i))))
+//+  val freePtr = VecInit(Seq.tabulate(commitWidth)(i => tailPtr + i.U))
+//   for (i <- 0 until freeListSize) {
+//     val freeReqOH = VecInit(io.freeReq.zipWithIndex.map { case (w, idx) =>
+//-      w && freePtr(idx).value === i.U
+//+      val freeIdx = PopCount(io.freeReq.take(idx))
+//+      w && freeIdx >= recentFreeBypassCount && freePtr((freeIdx - recentFreeBypassCount).asUInt).value === i.U
+//     })
+//     val freePhyReg = Mux1H(freeReqOH, io.freePhyReg)
+//     when(freeReqOH.asUInt.orR) {
+//@@ -57,14 +63,14 @@ class StdFreeList(
+//     XSDebug(io.freeReq(i), p"req#$i free physical reg: ${io.freePhyReg(i)}\n")
+//   }
+// 
+//-  tailPtrNext := tailPtr + PopCount(io.freeReq)
+//+  tailPtrNext := tailPtr + remainingFreeCount
+//   tailPtr := tailPtrNext
+// 
+//   //
+//   // allocate new physical registers for instructions at rename stage
+//   //
+//   val freeRegCnt = Wire(UInt()) // number of free registers in free list
+//-  io.canAllocate := GatedValidRegNext(freeRegCnt >= RenameWidth.U) // use RegNext for better timing
+//+  io.canAllocate := GatedValidRegNext(freeRegCnt +& freeReqCount >= normalAllocateCount) // use RegNext for better timing
+//   XSDebug(p"freeRegCnt: $freeRegCnt\n")
+// 
+//   val freeListVec = Wire(Vec(freeListSize, Vec(RenameWidth, UInt(PhyRegIdxWidth.W))))
+//@@ -79,9 +85,21 @@ class StdFreeList(
+//   }
+// 
+//   val phyRegCandidates = Mux1H(headPtrOHVec(0), freeListVec)
+//+  val isNormalAlloc = io.canAllocate && io.doAllocate
+//+  recentFreeBypassCount := Mux(isNormalAlloc, freeReqCount min normalAllocateCount, 0.U)
+// 
+//   for(i <- 0 until RenameWidth) {
+//-    io.allocatePhyReg(i) := phyRegCandidates(PopCount(io.allocateReq.take(i)))
+//+    val allocIdx = PopCount(io.allocateReq.take(i))
+//+    val recentFreeCandidates = VecInit((0 until commitWidth).map { j =>
+//+      Mux1H(io.freeReq.zip(io.freePhyReg).zipWithIndex.map { case ((req, preg), idx) =>
+//+        (req && PopCount(io.freeReq.take(idx)) === allocIdx) -> preg
+//+      })
+//+    })
+//+    io.allocatePhyReg(i) := Mux(
+//+      allocIdx < recentFreeBypassCount,
+//+      recentFreeCandidates(allocIdx),
+//+      phyRegCandidates(allocIdx - recentFreeBypassCount)
+//+    )
+//     XSDebug(p"req:${io.allocateReq(i)} canAllocate:${io.canAllocate} pdest:${io.allocatePhyReg(i)}\n")
+//   }
+//   val doCommit = io.commit.doCommit
+//@@ -92,13 +110,12 @@ class StdFreeList(
+//   archHeadPtr := archHeadPtrNext
+// 
+//   val isWalkAlloc = io.walk && io.doAllocate
+//-  val isNormalAlloc = io.canAllocate && io.doAllocate
+//   val isAllocate = isWalkAlloc || isNormalAlloc
+//-  val numAllocate = Mux(io.walk, PopCount(io.walkReq), PopCount(io.allocateReq))
+//+  val numAllocate = Mux(io.walk, PopCount(io.walkReq), remainingAllocateCount)
+//   val headPtrAllocate = Mux(lastCycleRedirect, redirectedHeadPtr, headPtr + numAllocate)
+//   val headPtrOHAllocate = Mux(lastCycleRedirect, redirectedHeadPtrOH, headPtrOHVec(numAllocate))
+//   freeRegCnt := Mux(isWalkAlloc && !lastCycleRedirect, distanceBetween(tailPtrNext, headPtr) - PopCount(io.walkReq),
+//-                Mux(isNormalAlloc,                     distanceBetween(tailPtrNext, headPtr) - PopCount(io.allocateReq),
+//+                Mux(isNormalAlloc,                     distanceBetween(tailPtrNext, headPtr) - remainingAllocateCount,
+//                                                        distanceBetween(tailPtrNext, headPtr)))
+// 
+//   // priority: (1) exception and flushPipe; (2) walking; (3) mis-prediction; (4) normal dequeue
+//diff --git a/src/main/scala/xiangshan/mem/lsqueue/NewStoreQueue.scala b/src/main/scala/xiangshan/mem/lsqueue/NewStoreQueue.scala
+//index bdf99707e..fa80bacf5 100644
+//--- a/src/main/scala/xiangshan/mem/lsqueue/NewStoreQueue.scala
+//+++ b/src/main/scala/xiangshan/mem/lsqueue/NewStoreQueue.scala
+//@@ -578,15 +578,15 @@ abstract class NewStoreQueueBase(implicit p: Parameters) extends LSQModule {
+//       )
+//       val s2OutMask            = ParallelLookUp(s2ByteSelectOffset, s2SelectMask) & s2LoadMaskEnd
+// 
+//-      val s2FullOverlap        = s2SelectDataEntry.byteStart <= s2LoadStart && s2SelectDataEntry.byteEnd >= s2LoadEnd
+//       // First condition: access extends beyond the lower log2Ceil(VLEN/8) bits.
+//       // Second condition: higher bits of the virtual address within the page offset are non-zero, indicating a potential cross-page access.
+//       val s2Cross4KPage        = s2SelectDataEntry.byteEnd(VWordOffset) && s2SelectDataEntry.vaddr(pageOffset - 1, VWordOffset).andR && s2ForwardValid
+//-      val s2SafeForward        = !s2MultiMatch || s2FullOverlap
+// 
+//       //TODO: only use for 128-bit align forward, should revert when other forward source support rotate forward !!!!
+//       val s2FinalData          = s2OutData << (s2LoadStart * 8.U)
+//       val s2FinalMask          = s2OutMask << s2LoadStart
+//+      val s2FullByteCoverage   = (~s2FinalMask & s2LoadMaskEnd) === 0.U
+//+      val s2SafeForward        = !s2MultiMatch || s2FullByteCoverage
+// 
+//       val s1Resp = io.query(i).s1Resp
+//       val s2Resp = io.query(i).s2Resp
